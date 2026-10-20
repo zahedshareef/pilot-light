@@ -219,6 +219,7 @@ class App: NSObject, NSApplicationDelegate {
     var capacityWh = 0.0
 
     var recoveryReady = false
+    var recoveryError: String?
     var armed: Bool { enabled && helperOK && recoveryReady && sessionActive && hasLid && !(screenLocked && !awakeWhenLocked) }
     var helperOK = false
     let powerKey = powerModeSettings()?.key
@@ -296,12 +297,16 @@ class App: NSObject, NSApplicationDelegate {
         helperOK = FileManager.default.fileExists(atPath: sudoersPath) &&
             execute("/usr/bin/sudo", ["-n", "-l", "/usr/bin/pmset", "sleepnow"]).status == 0
         recoveryReady = false
+        recoveryError = nil
         guard helperOK, writeHeartbeat() else { return }
         do {
-            if watchdog.status == .notRegistered { try watchdog.register() }
+            if watchdog.status == .notRegistered || watchdog.status == .notFound { try watchdog.register() }
             recoveryReady = watchdog.status == .enabled
-        } catch { NSLog("Pilot Light: watchdog unavailable: \(error)") }
-        if !recoveryReady { SMAppService.openSystemSettingsLoginItems() }
+        } catch {
+            recoveryError = error.localizedDescription
+            NSLog("Pilot Light: watchdog unavailable: \(error)")
+        }
+        if watchdog.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
     }
 
     func apply() {
@@ -392,13 +397,14 @@ class App: NSObject, NSApplicationDelegate {
         toggle.isEnabled = hasLid
         toggle.title = hasLid ? "Keep awake when lid closed" : "This Mac has no lid, nothing to do"
         install.isHidden = !hasLid || (helperOK && recoveryReady)
-        install.title = helperOK ? "Approve background recovery…" : "Install helper (admin)…"
+        install.title = !helperOK ? "Install helper (admin)…"
+            : watchdog.status == .requiresApproval ? "Approve background recovery…" : "Repair background recovery…"
         removeItem.isHidden = !helperOK
         lowPowerItem.isHidden = powerKey == nil || !hasLid
         let setupNeeded = hasLid && (!helperOK || !recoveryReady)
         item.button?.image = glyphs[setupNeeded ? "setup" : armed ? "active" : "disabled"]
         item.button?.setAccessibilityLabel(setupNeeded ? "Pilot Light: setup needed" : armed ? "Pilot Light: on" : "Pilot Light: off")
-        item.button?.toolTip = helperOK && !recoveryReady ? "Background recovery needs approval; keep-awake is disabled"
+        item.button?.toolTip = helperOK && !recoveryReady ? (recoveryError ?? "Background recovery is unavailable; keep-awake is disabled")
             : !armed ? "Lid close: sleep"
             : deskMode ? "Lid closed with an external display: normal desk use"
             : "Lid close: stay awake, low power, screen off"
@@ -473,7 +479,14 @@ class App: NSObject, NSApplicationDelegate {
     }
 
     @objc func installHelper() {
-        if helperOK { prepareRecovery(); apply(); return }
+        if helperOK {
+            prepareRecovery(); apply()
+            if let error = recoveryError {
+                let alert = NSAlert(); alert.messageText = "Background recovery could not start"
+                alert.informativeText = error; alert.runModal()
+            }
+            return
+        }
         let user = NSUserName()
         guard user.range(of: "^[A-Za-z_][A-Za-z0-9_.-]*$", options: .regularExpression) != nil else {
             let alert = NSAlert(); alert.messageText = "Unsupported account name"; alert.runModal(); return
@@ -548,6 +561,19 @@ if CommandLine.arguments.contains("--selftest") {
     print("This Mac: lid \(hasLid ? "yes" : "no"), external display \(externalDisplayActive() ? "yes" : "no"), power setting \(powerModeSettings()?.key ?? "none"), " +
           "battery \(batteryPercent().map { "\($0)%" } ?? "on AC"), draw \(batteryDraw().map { String(format: "%.1f W", $0.watts) } ?? "n/a on AC")")
     exit(0)
+}
+
+if CommandLine.arguments.contains("--recovery-status") {
+    print("Watchdog status: \(watchdog.status.rawValue)")
+    exit(0)
+}
+if CommandLine.arguments.contains("--register-recovery") {
+    do {
+        guard writeHeartbeat() else { print("Heartbeat write failed"); exit(1) }
+        try watchdog.register()
+        print("Watchdog status: \(watchdog.status.rawValue)")
+        exit(0)
+    } catch { print("Watchdog registration failed: \(error)"); exit(1) }
 }
 
 let app = NSApplication.shared

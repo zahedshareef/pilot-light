@@ -1,8 +1,10 @@
 # Pilot Light (beta)
 
-## Maintained fork: 0.9.2
+## Maintained fork: 0.9.3
 
 This fork of CyrisXD/pilot-light hardens privileged installation and background recovery.
+
+Version 0.9.3 also registers recovery when macOS reports the service as not found, and distinguishes registration errors from missing user approval. The installed build's recovery registration was verified on macOS 27.0.1.
 
 - The administrator script generates its sudoers configuration in a root-owned staging directory, validates it, and installs only the fixed power-management commands. There is no user-writable temporary configuration at the privilege boundary.
 - The background agent checks every 10 seconds for a missing process or a heartbeat older than 20 seconds. It restores sleep and explicitly requests sleep after a crash or hang (usually within 30 seconds for a hang, subject to macOS scheduling).
