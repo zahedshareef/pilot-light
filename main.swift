@@ -10,8 +10,8 @@ import ServiceManagement
 
 // Rename this file whenever pmsetCmds changes, so existing installs are asked to reinstall the helper.
 let sudoersPath = "/etc/sudoers.d/pilotlight"
-// Background check that turns lid-close sleep back on if Pilot Light isn't running (after a crash
-// or force quit), so the Mac never stays awake unattended. Bundled in Contents/Library/LaunchAgents.
+// Background check restores sleep and requests it after a crash or stale heartbeat.
+// Bundled in Contents/Library/LaunchAgents; requires user approval.
 let watchdog = SMAppService.agent(plistName: "nz.sudolabs.pilotlight.watchdog.plist")
 
 let supportLinks = [
@@ -19,21 +19,65 @@ let supportLinks = [
     ("Buy Me a Coffee", "https://buymeacoffee.com/FiRmVXOZh"),
 ]
 // macOS 14+/newer models name the setting "powermode"; older ones "lowpowermode". -b/-c restore per power source.
-let pmsetCmds = ["-a disablesleep 0", "-a disablesleep 1"] +
+let pmsetCmds = ["-a disablesleep 0", "-a disablesleep 1", "sleepnow"] +
     ["powermode", "lowpowermode"].flatMap { k in ["-a", "-b", "-c"].flatMap { f in (0...2).map { "\(f) \(k) \($0)" } } }
 
-@discardableResult
-func run(_ path: String, _ args: [String]) -> String {
+func execute(_ path: String, _ args: [String]) -> (output: String, status: Int32) {
     let p = Process(), pipe = Pipe()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
     p.standardOutput = pipe; p.standardError = pipe
-    try? p.run(); p.waitUntilExit()
-    return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    do { try p.run() } catch { return (error.localizedDescription, -1) }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (String(decoding: data, as: UTF8.self), p.terminationStatus)
 }
 
+@discardableResult
+func run(_ path: String, _ args: [String]) -> String { execute(path, args).output }
+
 // Only the exact commands whitelisted in sudoers; -n never prompts.
-func pmset(_ cmd: String) { run("/usr/bin/sudo", ["-n", "/usr/bin/pmset"] + cmd.split(separator: " ").map(String.init)) }
+@discardableResult
+func pmset(_ cmd: String) -> Bool { execute("/usr/bin/sudo", ["-n", "/usr/bin/pmset"] + cmd.split(separator: " ").map(String.init)).status == 0 }
+
+let heartbeatURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/Pilot Light/heartbeat")
+
+func writeHeartbeat() -> Bool {
+    do {
+        try FileManager.default.createDirectory(at: heartbeatURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: heartbeatURL, options: .atomic)
+        return true
+    } catch { return false }
+}
+
+// Quote each shell argument, then separately escape the complete script for AppleScript.
+func shellQuote(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+func appleScriptString(_ text: String) -> String {
+    "\"" + text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r") + "\""
+}
+
+func privilegedScript(_ script: String) -> Bool {
+    var error: NSDictionary?
+    let result = NSAppleScript(source: "do shell script \(appleScriptString(script)) with administrator privileges")?
+        .executeAndReturnError(&error)
+    return result != nil && error == nil
+}
+
+func installerScript(user: String) -> String {
+    let rule = "\(user) ALL=(root) NOPASSWD: " + pmsetCmds.map { "/usr/bin/pmset \($0)" }.joined(separator: ", ") + "\n"
+    // This entire script runs as root. No user-writable file crosses the privilege boundary.
+    return """
+    set -eu
+    umask 077
+    stage=$(/usr/bin/mktemp -d /private/tmp/pilotlight-install.XXXXXXXX)
+    trap '/bin/rm -rf "$stage"' EXIT
+    /usr/bin/printf '%s' \(shellQuote(rule)) > "$stage/rule"
+    /usr/sbin/visudo -cf "$stage/rule"
+    /usr/bin/install -m 0440 -o root -g wheel "$stage/rule" \(sudoersPath)
+    """
+}
 
 // nil on Macs without a lid (Mac mini, iMac, Studio, Pro).
 func lidClosed() -> Bool? {
@@ -109,7 +153,7 @@ func batteryDraw(_ p: [String: Any]) -> (watts: Double, capacityWh: Double)? {
 }
 
 // Update check: compares the latest GitHub release tag ("v1.2.0") with this build's version.
-let releasesAPI = URL(string: "https://api.github.com/repos/CyrisXD/pilot-light/releases/latest")!
+let releasesAPI = URL(string: "https://api.github.com/repos/zahedshareef/pilot-light/releases/latest")!
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
 
 func isNewer(_ tag: String, than current: String) -> Bool {
@@ -174,8 +218,9 @@ class App: NSObject, NSApplicationDelegate {
     var lastChange = Date(), lastSample = Date.distantPast
     var capacityWh = 0.0
 
-    var armed: Bool { enabled && sessionActive && hasLid && !(screenLocked && !awakeWhenLocked) }
-    var helperOK = FileManager.default.fileExists(atPath: sudoersPath)
+    var recoveryReady = false
+    var armed: Bool { enabled && helperOK && recoveryReady && sessionActive && hasLid && !(screenLocked && !awakeWhenLocked) }
+    var helperOK = false
     let powerKey = powerModeSettings()?.key
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -236,7 +281,7 @@ class App: NSObject, NSApplicationDelegate {
         ws.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main) { _ in restore() }
 
         restorePowerMode() // in case a previous run quit or crashed with the lid closed
-        if helperOK { try? watchdog.register() }
+        prepareRecovery()
         // Polls the lid every 2 seconds. An IOKit interest notification would react faster, but polling is simpler and cheap.
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
         Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in self?.checkForUpdate() }
@@ -246,6 +291,19 @@ class App: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ n: Notification) { restore() }
 
+    func prepareRecovery() {
+        // The new sleepnow permission distinguishes this helper from older installations.
+        helperOK = FileManager.default.fileExists(atPath: sudoersPath) &&
+            execute("/usr/bin/sudo", ["-n", "-l", "/usr/bin/pmset", "sleepnow"]).status == 0
+        recoveryReady = false
+        guard helperOK, writeHeartbeat() else { return }
+        do {
+            if watchdog.status == .notRegistered { try watchdog.register() }
+            recoveryReady = watchdog.status == .enabled
+        } catch { NSLog("Pilot Light: watchdog unavailable: \(error)") }
+        if !recoveryReady { SMAppService.openSystemSettingsLoginItems() }
+    }
+
     func apply() {
         bailed = false
         // disablesleep has to be set before the lid closes (lid close sleeps instantly),
@@ -253,7 +311,7 @@ class App: NSObject, NSApplicationDelegate {
         pmset(armed ? "-a disablesleep 1" : "-a disablesleep 0")
         if !armed { restorePowerMode() }
         // Turning sleep back on while the lid is already shut doesn't sleep the Mac by itself.
-        if !armed && wasClosed && !deskMode { run("/usr/bin/pmset", ["sleepnow"]) }
+        if !armed && wasClosed && !deskMode { pmset("sleepnow") }
         refreshUI()
     }
 
@@ -265,6 +323,10 @@ class App: NSObject, NSApplicationDelegate {
     }
 
     func tick() {
+        // Check both approval and heartbeat writes before continuing to suppress sleep.
+        let wasReady = recoveryReady
+        recoveryReady = helperOK && watchdog.status == .enabled && writeHeartbeat()
+        if wasReady != recoveryReady { apply() }
         let closed = lidClosed() ?? false
         let desk = closed && externalDisplayActive()
         if closed != wasClosed || desk != deskMode {
@@ -287,7 +349,7 @@ class App: NSObject, NSApplicationDelegate {
             NSLog("Pilot Light: sleeping, \(why)")
             bailed = true
             pmset("-a disablesleep 0")
-            run("/usr/bin/pmset", ["sleepnow"])
+            pmset("sleepnow")
         }
         if Date().timeIntervalSince(lastSample) >= 30 { sample() }
     }
@@ -326,16 +388,18 @@ class App: NSObject, NSApplicationDelegate {
     }
 
     func refreshUI() {
-        let helper = helperOK || !hasLid
         toggle.state = enabled && hasLid ? .on : .off
         toggle.isEnabled = hasLid
         toggle.title = hasLid ? "Keep awake when lid closed" : "This Mac has no lid, nothing to do"
-        install.isHidden = helper
+        install.isHidden = !hasLid || (helperOK && recoveryReady)
+        install.title = helperOK ? "Approve background recovery…" : "Install helper (admin)…"
         removeItem.isHidden = !helperOK
         lowPowerItem.isHidden = powerKey == nil || !hasLid
-        item.button?.image = glyphs[!helper ? "setup" : armed ? "active" : "disabled"]
-        item.button?.setAccessibilityLabel(!helper ? "Pilot Light: setup needed" : armed ? "Pilot Light: on" : "Pilot Light: off")
-        item.button?.toolTip = !armed ? "Lid close: sleep"
+        let setupNeeded = hasLid && (!helperOK || !recoveryReady)
+        item.button?.image = glyphs[setupNeeded ? "setup" : armed ? "active" : "disabled"]
+        item.button?.setAccessibilityLabel(setupNeeded ? "Pilot Light: setup needed" : armed ? "Pilot Light: on" : "Pilot Light: off")
+        item.button?.toolTip = helperOK && !recoveryReady ? "Background recovery needs approval; keep-awake is disabled"
+            : !armed ? "Lid close: sleep"
             : deskMode ? "Lid closed with an external display: normal desk use"
             : "Lid close: stay awake, low power, screen off"
         lowPowerItem.state = lowPower ? .on : .off
@@ -409,14 +473,13 @@ class App: NSObject, NSApplicationDelegate {
     }
 
     @objc func installHelper() {
+        if helperOK { prepareRecovery(); apply(); return }
         let user = NSUserName()
-        let rule = "\(user) ALL=(root) NOPASSWD: " + pmsetCmds.map { "/usr/bin/pmset \($0)" }.joined(separator: ", ") + "\n"
-        let tmp = NSTemporaryDirectory() + "pilotlight.sudoers"
-        try? rule.write(toFile: tmp, atomically: true, encoding: .utf8)
-        let sh = "/usr/sbin/visudo -cf '\(tmp)' && /usr/bin/install -m 0440 -o root -g wheel '\(tmp)' \(sudoersPath)"
-        NSAppleScript(source: "do shell script \"\(sh)\" with administrator privileges")?.executeAndReturnError(nil)
-        helperOK = FileManager.default.fileExists(atPath: sudoersPath)
-        if helperOK { try? watchdog.register() }
+        guard user.range(of: "^[A-Za-z_][A-Za-z0-9_.-]*$", options: .regularExpression) != nil else {
+            let alert = NSAlert(); alert.messageText = "Unsupported account name"; alert.runModal(); return
+        }
+        guard privilegedScript(installerScript(user: user)) else { return }
+        prepareRecovery()
         apply()
     }
 
@@ -430,10 +493,11 @@ class App: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         restore() // while sudo still allows it
-        let removed = NSAppleScript(source: "do shell script \"/bin/rm -f \(sudoersPath)\" with administrator privileges")?.executeAndReturnError(nil) != nil
+        let removed = privilegedScript("/usr/bin/pmset -a disablesleep 0 && /bin/rm -f \(sudoersPath)")
         guard removed else { return }
         try? watchdog.unregister()
         helperOK = FileManager.default.fileExists(atPath: sudoersPath)
+        recoveryReady = false
         refreshUI()
     }
 }
@@ -442,8 +506,8 @@ class App: NSObject, NSApplicationDelegate {
 func restorePowerMode() {
     guard let saved = UserDefaults.standard.dictionary(forKey: "savedPowerMode") as? [String: Int],
           let key = powerModeSettings()?.key else { return }
-    saved.forEach { pmset("\($0.key) \(key) \($0.value)") }
-    UserDefaults.standard.removeObject(forKey: "savedPowerMode")
+    let restored = saved.map { pmset("\($0.key) \(key) \($0.value)") }.allSatisfy { $0 }
+    if restored { UserDefaults.standard.removeObject(forKey: "savedPowerMode") }
 }
 
 func restore() {
@@ -452,6 +516,13 @@ func restore() {
 }
 
 if CommandLine.arguments.contains("--selftest") {
+    precondition(shellQuote("a'b") == "'a'\\''b'")
+    precondition(appleScriptString("a\"b\\c\nd") == "\"a\\\"b\\\\c\\nd\"")
+    precondition(installerScript(user: "test_user").contains("/private/tmp/pilotlight-install.XXXXXXXX"))
+    precondition(!installerScript(user: "test_user").contains(NSTemporaryDirectory() + "pilotlight.sudoers"))
+    precondition(execute("/bin/sh", ["-n", "-c", installerScript(user: "test_user")]).status == 0)
+    let quotedSample = "quote' \" $HOME `id`\nsecond line"
+    precondition(run("/bin/sh", ["-c", "printf '%s' " + shellQuote(quotedSample)]) == quotedSample)
     precondition(bailReason(.nominal, nil) == nil)
     precondition(bailReason(.fair, 50) == nil)
     precondition(bailReason(.serious, nil) == "too hot")

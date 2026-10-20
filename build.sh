@@ -2,11 +2,11 @@
 # Builds Pilot Light.app into ~/Applications. Re-run after editing main.swift.
 set -e
 cd "$(dirname "$0")"
-APP="$HOME/Applications/Pilot Light.app"
+APP=${APP_OUTPUT:-"$HOME/Applications/Pilot Light.app"}
 mkdir -p "$APP/Contents/MacOS"
 # Universal (Apple Silicon + Intel), runs on macOS 13 Ventura and later.
 MIN=13.0
-VERSION=${VERSION:-0.9.1}
+VERSION=${VERSION:-0.9.2}
 TMP=$(mktemp -d)
 swiftc -O -target arm64-apple-macos$MIN main.swift -o "$TMP/arm64"
 swiftc -O -target x86_64-apple-macos$MIN main.swift -o "$TMP/x86_64"

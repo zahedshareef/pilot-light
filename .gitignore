@@ -1,4 +1,6 @@
 .DS_Store
+__pycache__/
+*.pyc
 # Local power measurements (list the apps running on the test Mac)
 logs/
 # Design tooling scratch

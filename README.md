@@ -1,10 +1,24 @@
 # Pilot Light (beta)
 
+## Maintained fork: 0.9.2
+
+This fork of CyrisXD/pilot-light hardens privileged installation and background recovery.
+
+- The administrator script generates its sudoers configuration in a root-owned staging directory, validates it, and installs only the fixed power-management commands. There is no user-writable temporary configuration at the privilege boundary.
+- The background agent checks every 10 seconds for a missing process or a heartbeat older than 20 seconds. It restores sleep and explicitly requests sleep after a crash or hang (usually within 30 seconds for a hang, subject to macOS scheduling).
+- Keep-awake remains disabled until the helper is installed, the background agent is approved, and heartbeat writes succeed. Approve **Pilot Light** in System Settings > General > Login Items & Extensions when prompted. Existing installations must reinstall the helper for the new sleep permission.
+- Failed Low Power Mode restoration retains the saved settings for a later retry. Recovery after a crash does not itself restore Low Power Mode; reopening the app retries restoration.
+- Update checks point to this fork, so an upstream release does not replace these changes.
+
+This build is ad-hoc signed, not Apple notarized. It remains a beta. Automated tests cover pure app logic and simulated watchdog cases; actual closed-lid sleep, thermal cutoffs, and battery cutoffs require supervised hardware validation. Keep the Mac ventilated during initial testing.
+
+Validation: `python3 -m unittest discover -s tests -v`, plus the built executable's `--selftest` mode. Build to a chosen location using `APP_OUTPUT="/absolute/path/Pilot Light.app" ./build.sh`.
+
 **Lid shut. Pilot light on.** A tiny macOS menu bar app that keeps your MacBook awake with the lid closed, so AI coding agents keep working, on under a third of the power.
 
 ![Your agents don’t need the lid open, or that much power. 16.7 W with the lid open, 4.8 W with it closed.](site/assets/og.png)
 
-**Website:** [pilotlight.sudolabs.nz](https://pilotlight.sudolabs.nz) · **Download:** [latest release](https://github.com/CyrisXD/pilot-light/releases/latest)
+**Original project:** [CyrisXD/pilot-light](https://github.com/CyrisXD/pilot-light) · **Fork:** [zahedshareef/pilot-light](https://github.com/zahedshareef/pilot-light)
 
 ## What it does
 
@@ -33,15 +47,15 @@ Once a day it checks GitHub for a newer release and shows **Update available** i
 
 1. Download the latest release and drag **Pilot Light** to Applications. It isn't notarized yet: the first time you open it, go to **System Settings › Privacy & Security** and click **Open Anyway**.
 2. Click the flame in the menu bar, then **Install helper (admin)…**. This one admin prompt adds a sudoers rule that allows only `pmset` sleep and Low Power changes.
-3. Close the lid.
+3. Approve the background agent in System Settings if prompted. Confirm the menu reports that keep-awake is on before closing the lid.
 
 While Pilot Light is on, the Mac also won't idle-sleep with the lid open (the display still turns off).
 
-If Pilot Light crashes or is force-quit, a small background check (installed with the helper) turns lid-close sleep back on within a minute.
+If Pilot Light crashes, is force-quit, or stops updating its heartbeat, a background check restores sleep and explicitly requests it. See the fork notes above for timing and limitations.
 
 ## Uninstall
 
-Choose **Remove helper…** from the Pilot Light menu, quit the app, and drag it to the Bin. To remove the helper by hand instead: `sudo rm /etc/sudoers.d/pilotlight`.
+Choose **Remove helper…** from the Pilot Light menu, quit the app, and drag it to the Bin. This also unregisters the background agent. If removing the sudoers rule manually, first restore sleep with `sudo /usr/bin/pmset -a disablesleep 0`, then remove `/etc/sudoers.d/pilotlight`; manually removing the rule alone does not restore sleep or unregister the agent.
 
 ## Beta
 
@@ -50,7 +64,7 @@ Pilot Light is in public beta. The heat and battery cutoffs have only been teste
 ## Build from source
 
 ```bash
-git clone https://github.com/CyrisXD/pilot-light
+git clone https://github.com/zahedshareef/pilot-light
 cd pilot-light
 ./build.sh
 open ~/Applications/"Pilot Light.app"
